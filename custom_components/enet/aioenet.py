@@ -10,6 +10,8 @@ from typing import Any, Dict, Union
 import asyncio
 import aiohttp
 
+from homeassistant.exceptions import HomeAssistantError
+
 from .enums import ChannelUseType
 from .enet_data.data import enet_data
 from .enet_data.constants import CHANNEL_TYPES_IGNORED
@@ -39,6 +41,20 @@ class URL(StrEnum):
 
 ID_FILTER_ALL = "*"
 
+# Timeouts. The eNet server is slow and can stop answering entirely (for
+# minutes while it reboots), so every request needs an upper bound.
+# requestEvents is a long poll that blocks up to 30 s on the server side.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=5)
+EVENT_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=45, connect=5)
+
+# The server handles concurrent requests poorly (one HTTPS connection per
+# request on a small CPU). Limit commands that switch devices.
+MAX_CONCURRENT_COMMANDS = 2
+
+ERROR_CODE_AUTH = (-29998, -29997)
+ERROR_CODE_NO_EVENTS = -29999
+ERROR_CODE_NO_EVENTS_REGISTERED = -29394
+
 
 class AuthError(Exception):
     "Authentication error"
@@ -48,19 +64,35 @@ class EnetServerError(Exception):
     "Enet server error"
 
 
+class EnetNoEventsRegistered(EnetServerError):
+    """The server has no event subscriptions for this session (e.g. after a
+    server restart). The client must log in and subscribe again."""
+
+
+class EnetEventPollTimeout(Exception):
+    "requestEvents returned without events (normal long-poll timeout)"
+
+
+class EnetConnectionError(HomeAssistantError):
+    """The Enet server could not be reached or did not answer in time.
+
+    Subclasses HomeAssistantError so a failing service call is reported as a
+    normal Home Assistant error (and continue_on_error in scripts works)."""
+
+
 def auth_if_needed(func):
-    "Decorator used to reauthenticate if we get a AuthError"
+    "Decorator used to log in again when the session has expired"
 
     @functools.wraps(func)
-    def auth_wrapper(self, *args, **kwargs):
+    async def auth_wrapper(self, *args, **kwargs):
         "Perform re-authentication"
         try:
-            return func(self, *args, **kwargs)
+            return await func(self, *args, **kwargs)
         except AuthError:
-            log.warning("Trying to re-authenticate...")
-            self.simple_login()
+            log.warning("Enet session expired, logging in again")
+            await self.simple_login()
 
-        return func(self, *args, **kwargs)
+        return await func(self, *args, **kwargs)
 
     return auth_wrapper
 
@@ -90,6 +122,7 @@ class EnetClient:
         self._subscribers = []
         self.function_uid_map = {}
         self.devices = []
+        self.command_lock = asyncio.Semaphore(MAX_CONCURRENT_COMMANDS)
 
         if load_file:
             with open(load_file) as fp:
@@ -108,7 +141,7 @@ class EnetClient:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self._session.close()
+        await self.close()
         if exc_val:
             raise exc_val
         return exc_type
@@ -200,8 +233,21 @@ class EnetClient:
                 for callback in self._subscribers:
                     callback(data, device)
 
+    async def close(self):
+        """Close the HTTP session"""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+
     @auth_if_needed
-    async def request(self, url, method, params, raise_on_error=False, get_raw=False):
+    async def request(
+        self,
+        url,
+        method,
+        params,
+        raise_on_error=False,
+        get_raw=False,
+        timeout=REQUEST_TIMEOUT,
+    ):
         "Request data from the Enet Server"
         if self._offline:
             log.debug(
@@ -209,10 +255,32 @@ class EnetClient:
             )
             return None
 
-        return await self._do_request(url, method, params, raise_on_error, get_raw)
+        return await self._do_request(
+            url, method, params, raise_on_error, get_raw, timeout
+        )
 
     async def _do_request(
-        self, url, method, params, raise_on_error=False, get_raw=False
+        self,
+        url,
+        method,
+        params,
+        raise_on_error=False,
+        get_raw=False,
+        timeout=REQUEST_TIMEOUT,
+    ):
+        """Send one JSON-RPC request. Connection problems, timeouts and HTTP
+        errors are raised as EnetConnectionError."""
+        try:
+            return await self._do_request_raw(
+                url, method, params, raise_on_error, get_raw, timeout
+            )
+        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+            raise EnetConnectionError(
+                f"Enet server {self.baseurl} did not answer {method}: {err!r}"
+            ) from err
+
+    async def _do_request_raw(
+        self, url, method, params, raise_on_error, get_raw, timeout
     ):
         req = {
             "jsonrpc": "2.0",
@@ -222,7 +290,9 @@ class EnetClient:
         }
         self._api_counter += 1
         log.debug("Requesting %s%s %s", self.baseurl, url, method)
-        response = await self._session.post(f"{self.baseurl}{url}", json=req, ssl=False)
+        response = await self._session.post(
+            f"{self.baseurl}{url}", json=req, ssl=False, timeout=timeout
+        )
         if get_raw:
             return response
         if response.status >= 400:
@@ -238,11 +308,13 @@ class EnetClient:
         if "error" in json:
             returned_error = json["error"]
             error_msg = f"-> {url} {method} returned error: {returned_error}"
-            if returned_error["code"] in (-29998, -29997):
+            if returned_error["code"] in ERROR_CODE_AUTH:
                 log.warning("Got auth error: %s", json["error"])
                 raise AuthError
-            elif returned_error["code"] == -29999:
-                raise aiohttp.ServerTimeoutError
+            elif returned_error["code"] == ERROR_CODE_NO_EVENTS:
+                raise EnetEventPollTimeout
+            elif returned_error["code"] == ERROR_CODE_NO_EVENTS_REGISTERED:
+                raise EnetNoEventsRegistered(error_msg)
             else:
                 log.warning(error_msg)
                 raise EnetServerError(error_msg)
@@ -252,12 +324,16 @@ class EnetClient:
         return json["result"]
 
     async def simple_login(self):
-        """Login to the Enet Server"""
+        """Login to the Enet Server
+
+        Uses _do_request directly (not the auth_if_needed wrapper), so a wrong
+        password raises AuthError instead of retrying the login forever.
+        """
         params = dict(userName=self.user, userPassword=self.passwd)
-        response = await self.request(
+        response = await self._do_request(
             URL.MANAGEMENT, "userLogin", params, raise_on_error=True
         )
-        response = await self.request(
+        response = await self._do_request(
             URL.MANAGEMENT, "setClientRole", dict(clientRole="CR_VISU")
         )
         return response
@@ -265,9 +341,9 @@ class EnetClient:
     async def simple_logout(self):
         """Logout of the Enet Server"""
         try:
-            await self.request(URL.MANAGEMENT, "userLogout", None)
+            await self._do_request(URL.MANAGEMENT, "userLogout", None)
         finally:
-            await self._session.close()
+            await self.close()
 
     async def ping(self):
         """Ping server to keep connection alive"""
@@ -368,7 +444,8 @@ class EnetClient:
     async def activate_scene(self, scene_uid):
         """Activate the specified scene UID"""
         params = {"actionUID": scene_uid}
-        await self.request(URL.VISUALIZATION, "executeAction", params)
+        async with self.command_lock:
+            await self.request(URL.VISUALIZATION, "executeAction", params)
 
     async def setup_event_subscription(self, func_uid):
         """Subscribe for outputDeviceFunction events"""
@@ -391,9 +468,14 @@ class EnetClient:
     async def get_events(self):
         """Poll Enet server for events"""
         try:
-            result = await self.request(URL.VISUALIZATION, "requestEvents", None)
+            result = await self.request(
+                URL.VISUALIZATION,
+                "requestEvents",
+                None,
+                timeout=EVENT_REQUEST_TIMEOUT,
+            )
             return result
-        except aiohttp.ServerTimeoutError:
+        except EnetEventPollTimeout:
             return None
 
 
@@ -804,9 +886,10 @@ class ActuatorChannel(DeviceChannel):
 
         params["values"] = value_template
 
-        await self.device.client.request(
-            URL.VISUALIZATION, "callInputDeviceFunction", params
-        )
+        async with self.device.client.command_lock:
+            await self.device.client.request(
+                URL.VISUALIZATION, "callInputDeviceFunction", params
+            )
 
     async def turn_off(self):
         "Turn off device"

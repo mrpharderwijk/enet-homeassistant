@@ -14,15 +14,24 @@ from .enet_data.enums import ChannelTypeFunctionName
 from homeassistant.config_entries import ConfigEntry, ConfigEntryNotReady
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .aioenet import EnetClient, ActuatorChannel, SensorChannel
+from .aioenet import (
+    URL,
+    EnetClient,
+    EnetConnectionError,
+    EnetNoEventsRegistered,
+    ActuatorChannel,
+    SensorChannel,
+)
 from .const import (
     DOMAIN,
     ATTR_ENET_EVENT,
     EVENT_TYPE_INITIAL_PRESS,
     EVENT_TYPE_SHORT_RELEASE,
     EVENT_TYPE_LONG_RELEASE,
+    NAME_ENET_CONTROLLER,
 )
 from .device import async_setup_devices
 
@@ -48,6 +57,10 @@ EVENT_VALUE_TYPE_ROCKER_STATE = "VT_ROCKER_STATE"
 EVENT_VALUE_TYPE_ROCKER_SWITCH_TIME = "VT_ROCKER_SWITCH_TIME"
 EVENT_VALUE_DOWN_BUTTON = "DOWN_BUTTON"
 
+PING_INTERVAL = 28  # seconds; keeps the HTTPS session alive
+EVENT_RETRY_BASE_DELAY = 2  # seconds, multiplied by the number of failures
+EVENT_RETRY_MAX_DELAY = 60  # seconds
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Enet Smart Home from a config entry."""
@@ -66,22 +79,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     try:
         await hub.simple_login()
-    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+    except (asyncio.TimeoutError, aiohttp.ClientError, EnetConnectionError) as e:
+        await hub.close()
         raise ConfigEntryNotReady("Failed to login to Enet Smart Home") from e
 
     hass.data[DOMAIN][entry.entry_id] = hub
 
     try:
         hub.devices = await hub.get_devices()
+    except EnetConnectionError as e:
+        hass.data[DOMAIN].pop(entry.entry_id)
+        await hub.close()
+        raise ConfigEntryNotReady("Enet Smart Home did not return its devices") from e
     except Exception as e:
         _LOGGER.error("Failed to get devices from Enet Smart Home: %s", e)
+        hass.data[DOMAIN].pop(entry.entry_id)
+        await hub.close()
         return False
 
     await async_setup_devices(hub.coordinator)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     await hub.coordinator.setup_event_listeners()
 
-    hass.loop.create_task(hub.coordinator.async_refresh())
+    # Background loops are owned by the config entry, so Home Assistant cancels
+    # them when the entry is unloaded or reloaded (no orphaned loops that keep
+    # polling with an old session).
+    hub.coordinator.start_background_tasks()
     return True
 
 
@@ -89,9 +112,37 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     _LOGGER.debug("Unloading Enet Smart Home entry")
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hub = hass.data[DOMAIN].pop(entry.entry_id)
+        hub.coordinator.stop_background_tasks()
+        try:
+            # Free the session on the server and close the HTTP session
+            await hub.simple_logout()
+        except Exception as e:  # pylint: disable=broad-except
+            _LOGGER.debug("Logout from Enet server failed: %s", e)
+            await hub.close()
 
     return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant, config_entry: ConfigEntry, device_entry: DeviceEntry
+) -> bool:
+    """Allow manual removal of devices the Enet server no longer reports.
+
+    Devices that still exist on the Enet server (and the controller itself)
+    cannot be removed, as they would be recreated on the next reload anyway.
+    """
+    hub = hass.data.get(DOMAIN, {}).get(config_entry.entry_id)
+    if hub is None:
+        return False
+
+    known_uids = {device.uid for device in hub.devices}
+    known_uids.add(NAME_ENET_CONTROLLER)
+
+    return not any(
+        identifier[0] == DOMAIN and identifier[1] in known_uids
+        for identifier in device_entry.identifiers
+    )
 
 
 class EnetCoordinator(DataUpdateCoordinator):
@@ -113,9 +164,29 @@ class EnetCoordinator(DataUpdateCoordinator):
         self._last_event: Dict[str, Any] = {}
 
         self.function_uid_map: Dict[str, Any] = {}
-        if self.hub.baseurl.startswith("https://"):
-            asyncio.create_task(self.ping_forever())
+        self._background_tasks: list[asyncio.Task] = []
         _LOGGER.debug("EnetCoordinator initialized")
+
+    def start_background_tasks(self) -> None:
+        """Start the event loop (and the keep-alive ping for https)"""
+        entry = self.config_entry
+        self._background_tasks.append(
+            entry.async_create_background_task(
+                self.hass, self.async_refresh(), "enet event loop"
+            )
+        )
+        if self.hub.baseurl.startswith("https://"):
+            self._background_tasks.append(
+                entry.async_create_background_task(
+                    self.hass, self.ping_forever(), "enet keep-alive ping"
+                )
+            )
+
+    def stop_background_tasks(self) -> None:
+        """Cancel the event loop and ping before the session is closed"""
+        for task in self._background_tasks:
+            task.cancel()
+        self._background_tasks.clear()
 
     async def setup_event_listeners(self) -> None:
         """Setup event listener for all output functions"""
@@ -126,18 +197,50 @@ class EnetCoordinator(DataUpdateCoordinator):
             self.function_uid_map.update(func_uids)
             await device.register_events()
 
+    async def resubscribe(self) -> None:
+        """Log in again, register all events again and re-read the current
+        values. Needed after the Enet server restarted: it then forgets the
+        session and its event subscriptions."""
+        await self.hub.simple_login()
+        self.function_uid_map.clear()
+        await self.setup_event_listeners()
+        await self.refresh_current_values()
+        _LOGGER.info("Re-subscribed to Enet server events")
+
+    async def refresh_current_values(self) -> None:
+        """Read the current value of every actuator output function, so states
+        changed while events were not delivered are corrected"""
+        for device in self.hub.devices:
+            for channel in device.channels:
+                if not isinstance(channel, ActuatorChannel):
+                    continue
+                for output_function in list(channel.output_functions.values()):
+                    uid = output_function["uid"]
+                    try:
+                        result = await self.hub.request(
+                            URL.VISUALIZATION,
+                            "getCurrentValuesFromOutputDeviceFunction",
+                            {"deviceFunctionUID": uid},
+                        )
+                    except Exception as e:  # pylint: disable=broad-except
+                        _LOGGER.debug("Could not read %s (%s): %s", channel.name, uid, e)
+                        continue
+                    values = (result or {}).get("currentValues") or []
+                    if len(values) == 1:
+                        await channel.update_values(uid, values)
+        self.async_update_listeners()
+
     async def ping_forever(self):
         """Ping server to keep conncetion alive"""
-        delay = 28
         while True:
             try:
                 await self.hub.ping()
             except Exception as e:
                 _LOGGER.warning(
-                    "Failed to ping server: (%s), retrying in: %s", e, delay
+                    "Failed to ping server: (%s), retrying in: %s", e, PING_INTERVAL
                 )
 
-            await asyncio.sleep(delay)
+            await asyncio.sleep(PING_INTERVAL)
 
     async def _async_update_data_offline(self) -> NoReturn:
         """Simulate events when offline by randomly generating events - only for debugging"""
@@ -178,18 +281,33 @@ class EnetCoordinator(DataUpdateCoordinator):
 
         failcount = 0
         while True:
-            base_delay = 2
             try:
                 event = await self.hub.get_events()
                 failcount = 0
+            except EnetNoEventsRegistered:
+                _LOGGER.warning(
+                    "Enet server lost the event subscriptions (restarted?), "
+                    "logging in and subscribing again"
+                )
+                try:
+                    await self.resubscribe()
+                    failcount = 0
+                    continue
+                except Exception as e:  # pylint: disable=broad-except
+                    failcount += 1
+                    delay = min(EVENT_RETRY_BASE_DELAY * failcount, EVENT_RETRY_MAX_DELAY)
+                    _LOGGER.warning(
+                        "Failed to subscribe again: (%s), retrying in: %s", e, delay
+                    )
+                    await asyncio.sleep(delay)
+                    continue
             except Exception as e:
                 failcount += 1
+                delay = min(EVENT_RETRY_BASE_DELAY * failcount, EVENT_RETRY_MAX_DELAY)
                 _LOGGER.warning(
-                    "Failed to fetch events: (%s), retrying in: %s",
-                    e,
-                    base_delay * failcount,
+                    "Failed to fetch events: (%s), retrying in: %s", e, delay
                 )
-                await asyncio.sleep(base_delay * failcount)
+                await asyncio.sleep(delay)
                 continue
             if event:
                 try:

@@ -35,11 +35,13 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
     """
     hub = aioenet.EnetClient(data["url"], data["username"], data["password"])
     try:
-        response = await hub.simple_login()
+        await hub.simple_login()
     except aioenet.AuthError:
         raise InvalidAuth
-    except:
+    except Exception:
         raise CannotConnect
+    finally:
+        await hub.close()
 
     # Return info that you want to store in the config entry.
     return {"title": "Enet Smart Home"}
@@ -82,10 +84,22 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         reconfigure_entry = self._get_reconfigure_entry()
 
         if user_input is not None:
-            return self.async_update_reload_and_abort(
-                reconfigure_entry,
-                data_updates=user_input,
-            )
+            # Test the new settings first, so a wrong URL or password doesn't
+            # take the integration offline
+            try:
+                await validate_input(self.hass, user_input)
+            except CannotConnect:
+                errors["base"] = "cannot_connect"
+            except InvalidAuth:
+                errors["base"] = "invalid_auth"
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Unexpected exception")
+                errors["base"] = "unknown"
+            else:
+                return self.async_update_reload_and_abort(
+                    reconfigure_entry,
+                    data_updates=user_input,
+                )
 
         return self.async_show_form(
             step_id="reconfigure",
